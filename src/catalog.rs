@@ -24,11 +24,16 @@ pub fn codex_model_entry(
         })
         .collect();
 
-    // The gpt-5.6 family drives Codex's code-mode protocol; advertising it makes
-    // Codex send its tool set via `additional_tools`, which the proxy flattens to
-    // Chat functions. Older families keep the plain per-call function contract.
-    let is_gpt56 = name.starts_with("gpt-5.6");
-    let apply_patch_tool_type = if is_gpt56 { Some("freeform") } else { None };
+    // The gpt-5.6 and gpt-6 families drive Codex's code-mode protocol; advertising
+    // it makes Codex send its tool set via `additional_tools`, which the proxy
+    // flattens to Chat functions. Older families keep the plain per-call function
+    // contract.
+    let is_code_mode_family = name.starts_with("gpt-5.6") || name.starts_with("gpt-6");
+    let apply_patch_tool_type = if is_code_mode_family {
+        Some("freeform")
+    } else {
+        None
+    };
 
     let mut entry = serde_json::json!({
         "slug": name,
@@ -54,7 +59,7 @@ pub fn codex_model_entry(
         "experimental_supported_tools": [],
     });
 
-    if is_gpt56 {
+    if is_code_mode_family {
         entry["tool_mode"] = serde_json::json!("code_mode");
     }
 

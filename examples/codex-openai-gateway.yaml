@@ -62,6 +62,19 @@ models:
       base-url: $GATEWAY_BASE_URL
       timeout: 300
 
+  # gpt-6-astra does not support the "none" reasoning effort (reasoning is
+  # mandatory), and like gpt-5.6 it emits "max"/"ultra" tiers that Chat
+  # Completions gateways cap at "xhigh" — so it reuses the clamping profile.
+  # Its tool calling works over Chat Completions through this proxy even though
+  # the model's native contract is Responses-only.
+  gpt-6-astra:
+    model: openai/gpt-6-astra
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
   codex-auto-review:
     model: openai/gpt-5.5
     rewrite: openai-gateway
