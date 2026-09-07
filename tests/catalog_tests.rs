@@ -24,8 +24,8 @@ fn provider() -> ResolvedProvider {
 }
 
 #[test]
-fn gpt56_family_advertises_code_mode() {
-    for name in ["gpt-5.6-sol", "gpt-5.6-terra"] {
+fn code_mode_family_advertises_code_mode() {
+    for name in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] {
         let entry = codex_model_entry(name, &provider(), Some(272_000));
 
         assert_eq!(
@@ -41,12 +41,20 @@ fn gpt56_family_advertises_code_mode() {
             serde_json::json!([]),
             "{name} must not advertise experimental tools"
         );
+        assert_eq!(
+            entry["supported_reasoning_levels"],
+            serde_json::json!([
+                {"effort": "medium", "description": "Balanced"},
+                {"effort": "high", "description": "Deep"},
+            ]),
+            "{name} must advertise the provider's reasoning ladder"
+        );
         assert_eq!(entry["slug"], name);
     }
 }
 
 #[test]
-fn non_gpt56_omits_code_mode() {
+fn non_code_mode_family_omits_code_mode() {
     let entry = codex_model_entry("gpt-5.5", &provider(), Some(200_000));
 
     assert!(
