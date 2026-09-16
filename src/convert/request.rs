@@ -145,7 +145,7 @@ pub async fn responses_to_chat(
     // Walk input items
     let items: Vec<InputItem> = req.input;
     if !items.is_empty() {
-        let cutoff = old_tool_output_cutoff(&items, KEEP_LAST_TURNS);
+        let cutoff = old_tool_output_cutoff(&items, KEEP_LAST_TOOL_OUTPUTS);
         let mut deferred: Vec<chat::MessageRequest> = Vec::new();
         let mut pending_tool_calls: Vec<chat::ToolCallRequest> = Vec::new();
 
@@ -822,30 +822,39 @@ fn convert_tool_choice(tc: crate::types::tool::ToolChoice) -> Option<chat::ToolC
 // ── Tool-output truncation (age-based) ────────────────────────────────────
 //
 // Tool outputs dominate replayed context (~78% of bytes in real Codex
-// sessions). Outputs from the last `KEEP_LAST_TURNS` user turns are kept
-// verbatim because the model is likely still acting on them; older ones are
-// truncated to head+tail with a marker.
+// sessions). "Age" is measured in tool-output depth, not user turns: a single
+// Codex prompt can spawn dozens of sequential tool calls with no new user
+// message in between, so counting user turns left old, huge outputs in the
+// replayed history unbounded. The last `KEEP_LAST_TOOL_OUTPUTS` tool results
+// are kept verbatim because the model is likely still acting on them; older
+// ones are truncated to head+tail with a marker.
 
-const KEEP_LAST_TURNS: usize = 6;
-const MAX_OLD_TOOL_OUTPUT_CHARS: usize = 2048;
-const OLD_TOOL_OUTPUT_HEAD: usize = 1024;
-const OLD_TOOL_OUTPUT_TAIL: usize = 512;
+const KEEP_LAST_TOOL_OUTPUTS: usize = 8;
+const MAX_OLD_TOOL_OUTPUT_CHARS: usize = 4096;
+const OLD_TOOL_OUTPUT_HEAD: usize = 2048;
+const OLD_TOOL_OUTPUT_TAIL: usize = 1024;
 
 /// Index in `items` before which tool outputs are "old" and may be truncated.
-/// Everything from this index onward belongs to the last `keep_last_turns`
-/// user turns and is preserved verbatim. Returns 0 when there are not enough
-/// turns to truncate anything.
-fn old_tool_output_cutoff(items: &[InputItem], keep_last_turns: usize) -> usize {
-    let user_positions: Vec<usize> = items
+/// Everything from this index onward belongs to the last `keep_last` tool
+/// outputs (`FunctionCallOutput`/`CustomToolCallOutput`) and is preserved
+/// verbatim, regardless of how many user messages are interleaved. Returns 0
+/// when there are not enough tool outputs to truncate anything.
+fn old_tool_output_cutoff(items: &[InputItem], keep_last: usize) -> usize {
+    let output_positions: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, it)| matches!(it, InputItem::Message(m) if m.role == MessageRole::User))
+        .filter(|(_, it)| {
+            matches!(
+                it,
+                InputItem::FunctionCallOutput(_) | InputItem::CustomToolCallOutput(_)
+            )
+        })
         .map(|(i, _)| i)
         .collect();
-    if user_positions.len() <= keep_last_turns {
+    if output_positions.len() <= keep_last {
         return 0;
     }
-    user_positions[user_positions.len() - keep_last_turns]
+    output_positions[output_positions.len() - keep_last]
 }
 
 fn floor_char_boundary(s: &str, idx: usize) -> usize {
@@ -1038,7 +1047,7 @@ pub fn items_to_chat_messages(
     items: &[InputItem],
     state: &crate::app::State,
 ) -> Vec<chat::MessageRequest> {
-    let cutoff = old_tool_output_cutoff(items, KEEP_LAST_TURNS);
+    let cutoff = old_tool_output_cutoff(items, KEEP_LAST_TOOL_OUTPUTS);
     let mut messages: Vec<chat::MessageRequest> = Vec::new();
     let mut pending_reasoning: Option<String> = None;
     let mut deferred: Vec<chat::MessageRequest> = Vec::new();
@@ -1400,22 +1409,93 @@ mod tests {
         })
     }
 
-    #[test]
-    fn cutoff_zero_when_few_turns() {
-        let items = vec![user("a"), tool_out("c1", "x"), user("b")];
-        assert_eq!(old_tool_output_cutoff(&items, 6), 0);
+    fn custom_tool_out(call_id: &str, output: &str) -> InputItem {
+        InputItem::CustomToolCallOutput(CustomToolCallOutput {
+            call_id: call_id.to_string(),
+            output: CustomToolOutputValue::String(output.to_string()),
+            id: None,
+        })
+    }
+
+    fn call_id_at(items: &[InputItem], idx: usize) -> &str {
+        match &items[idx] {
+            InputItem::FunctionCallOutput(o) => &o.call_id,
+            InputItem::CustomToolCallOutput(o) => &o.call_id,
+            other => panic!("expected a tool output at index {idx}, got {other:?}"),
+        }
     }
 
     #[test]
-    fn cutoff_marks_old_turns() {
-        // 8 user turns, keep last 6 → cutoff at the 3rd user position (index 2).
+    fn cutoff_counts_tool_outputs_not_user_turns() {
+        // 1 user message + 20 tool outputs: the first 12 are old, the last 8
+        // (outputs #13-#20, item indices 13-20) are kept verbatim.
+        let mut items = vec![user("u")];
+        for i in 0..20 {
+            items.push(tool_out(&format!("c{i}"), "x"));
+        }
+        let cutoff = old_tool_output_cutoff(&items, KEEP_LAST_TOOL_OUTPUTS);
+        // Output positions are 1..=20; keep last 8 → boundary at position 13.
+        assert_eq!(cutoff, 13);
+        for idx in 1..=12 {
+            assert!(idx < cutoff, "output at index {idx} should be old");
+        }
+        for idx in 13..=20 {
+            assert!(idx >= cutoff, "output at index {idx} should be recent");
+        }
+    }
+
+    #[test]
+    fn cutoff_zero_when_at_most_keep_last_outputs() {
+        // 10 user turns interleaved with only 5 tool outputs: the old
+        // user-turn-based rule would have truncated here, but tool-output
+        // depth is what matters now, and 5 <= KEEP_LAST_TOOL_OUTPUTS (8).
         let mut items = Vec::new();
-        for _ in 0..8 {
+        for i in 0..5 {
+            items.push(user("u"));
+            items.push(tool_out(&format!("c{i}"), "x"));
+        }
+        for _ in 0..5 {
             items.push(user("u"));
         }
-        let cutoff = old_tool_output_cutoff(&items, 6);
-        // user positions are 0..8; keep last 6 → boundary at position index 2.
-        assert_eq!(cutoff, 2);
+        assert_eq!(old_tool_output_cutoff(&items, KEEP_LAST_TOOL_OUTPUTS), 0);
+    }
+
+    #[test]
+    fn cutoff_ignores_user_turn_placement() {
+        // Same 10 tool outputs, once behind a single leading user message and
+        // once with a user message between every output — the cutoff must
+        // land on the same tool-output boundary (3rd-from-last output) in
+        // both cases.
+        let mut single_leading_user = vec![user("u")];
+        let mut interleaved = Vec::new();
+        for i in 0..10 {
+            single_leading_user.push(tool_out(&format!("c{i}"), "x"));
+            interleaved.push(user("u"));
+            interleaved.push(tool_out(&format!("c{i}"), "x"));
+        }
+        let keep = 8;
+        let cutoff_a = old_tool_output_cutoff(&single_leading_user, keep);
+        let cutoff_b = old_tool_output_cutoff(&interleaved, keep);
+        // In both histories the first 2 outputs (of 10) are old, so the
+        // cutoff lands exactly on the 3rd output ("c2").
+        assert_eq!(call_id_at(&single_leading_user, cutoff_a), "c2");
+        assert_eq!(call_id_at(&interleaved, cutoff_b), "c2");
+    }
+
+    #[test]
+    fn cutoff_counts_both_output_variants() {
+        // FunctionCallOutput and CustomToolCallOutput both count toward the
+        // last-8 window.
+        let mut items = Vec::new();
+        for i in 0..10 {
+            if i % 2 == 0 {
+                items.push(tool_out(&format!("c{i}"), "x"));
+            } else {
+                items.push(custom_tool_out(&format!("c{i}"), "x"));
+            }
+        }
+        let cutoff = old_tool_output_cutoff(&items, KEEP_LAST_TOOL_OUTPUTS);
+        assert_eq!(cutoff, 2, "first 2 of 10 mixed outputs should be old");
     }
 
     #[test]
@@ -1426,12 +1506,23 @@ mod tests {
         assert!(out.starts_with(&"A".repeat(OLD_TOOL_OUTPUT_HEAD)));
         assert!(out.ends_with(&"A".repeat(OLD_TOOL_OUTPUT_TAIL)));
         assert!(out.len() < 10_000);
+        // head + marker + tail must fit comfortably under the cap.
+        assert!(out.len() <= MAX_OLD_TOOL_OUTPUT_CHARS + 64);
     }
 
     #[test]
     fn truncate_keeps_small_output() {
         let small = "tiny".to_string();
         assert_eq!(truncate_old_tool_output(small.clone()), small);
+    }
+
+    #[test]
+    fn truncate_keeps_output_at_or_under_cap() {
+        // Exactly at the cap, and comfortably under it, must be untouched.
+        let at_cap = "x".repeat(MAX_OLD_TOOL_OUTPUT_CHARS);
+        assert_eq!(truncate_old_tool_output(at_cap.clone()), at_cap);
+        let under_cap = "x".repeat(2048);
+        assert_eq!(truncate_old_tool_output(under_cap.clone()), under_cap);
     }
 
     #[test]
@@ -1442,6 +1533,18 @@ mod tests {
         assert!(out.contains("…[truncated"));
         // Round-trips as valid UTF-8 (String guarantees it; assert non-empty cut).
         assert!(out.len() < 20_000);
+    }
+
+    #[test]
+    fn truncate_respects_utf8_boundaries_three_byte_chars() {
+        // "€" is 3 bytes; the raw byte offsets OLD_TOOL_OUTPUT_HEAD (2048) and
+        // len - OLD_TOOL_OUTPUT_TAIL (4976) both fall mid-character, exercising
+        // both the floor (head) and ceil (tail) boundary adjustments.
+        let s = "€".repeat(2_000); // 6_000 bytes
+        let out = truncate_old_tool_output(s);
+        assert!(out.contains("…[truncated"));
+        assert!(out.starts_with(&"€".repeat(682))); // floor_char_boundary(2048) == 2046
+        assert!(out.ends_with(&"€".repeat(341))); // ceil_char_boundary(4976) == 4977
     }
 
     #[test]

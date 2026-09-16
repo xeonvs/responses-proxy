@@ -1705,3 +1705,172 @@ async fn s26_consecutive_function_calls_merge() {
     assert_eq!(msgs[3]["role"], "tool");
     assert_eq!(msgs[3]["tool_call_id"], "call_2");
 }
+
+// ── Scenario 27: Age-based tool-output truncation (KEEP_LAST_TOOL_OUTPUTS) ──
+// A single Codex prompt can spawn dozens of sequential tool calls with no new
+// user message in between. These exercise the real end-to-end path
+// (items_to_chat_messages) with a history built the way Codex actually
+// produces it, rather than the unit-level helpers tested in
+// src/convert/request.rs.
+
+fn big_tool_payload(tag: &str) -> String {
+    format!("{tag}:{}", "Z".repeat(30_000))
+}
+
+/// One user message followed by 12 call/output pairs (alternating
+/// function/custom tool calls), each output a distinct 30 KB payload tagged
+/// with its call id so truncated-vs-verbatim can be told apart.
+fn history_with_twelve_tool_pairs() -> Vec<responses_proxy::types::item::InputItem> {
+    let mut raw = vec![json!({
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "kick off many tool calls"}]
+    })];
+    for i in 0..12 {
+        let call_id = format!("call_{i}");
+        let payload = big_tool_payload(&call_id);
+        if i % 2 == 0 {
+            raw.push(json!({
+                "type": "function_call", "call_id": call_id,
+                "name": "run_tool", "arguments": "{}"
+            }));
+            raw.push(json!({
+                "type": "function_call_output", "call_id": call_id, "output": payload
+            }));
+        } else {
+            raw.push(json!({
+                "type": "custom_tool_call", "call_id": call_id,
+                "name": "run_custom_tool", "input": "do work"
+            }));
+            raw.push(json!({
+                "type": "custom_tool_call_output", "call_id": call_id, "output": payload
+            }));
+        }
+    }
+    serde_json::from_value(json!(raw)).unwrap()
+}
+
+#[test]
+fn age_truncation_keeps_last_eight_tool_outputs_verbatim() {
+    let items = history_with_twelve_tool_pairs();
+    let messages = responses_proxy::convert::items_to_chat_messages(&items, &test_state());
+    let j = serde_json::to_value(&messages).unwrap();
+
+    // [user, assistant(12 tool_calls), tool x12] — no flush point exists
+    // between the calls/outputs, so they land in one merged assistant
+    // message followed by the 12 deferred tool messages, in call order.
+    assert_eq!(j.as_array().unwrap().len(), 14);
+    assert_eq!(j[0]["role"], "user");
+    assert_eq!(j[1]["role"], "assistant");
+    assert_eq!(j[1]["tool_calls"].as_array().unwrap().len(), 12);
+
+    for i in 0..12 {
+        let call_id = format!("call_{i}");
+        let msg = &j[i + 2];
+        assert_eq!(msg["role"], "tool");
+        assert_eq!(msg["tool_call_id"], call_id);
+        let content = msg["content"].as_str().unwrap();
+        if i < 4 {
+            assert!(
+                content.contains("…[truncated"),
+                "output #{i} (of 12) should be old and truncated"
+            );
+            assert!(content.len() <= MAX_OLD_TOOL_OUTPUT_CHARS_TEST);
+        } else {
+            assert_eq!(
+                content,
+                big_tool_payload(&call_id),
+                "output #{i} is within the last 8 and must stay verbatim"
+            );
+        }
+    }
+}
+
+// Mirrors the private MAX_OLD_TOOL_OUTPUT_CHARS constant in src/convert/request.rs
+// (not exported); kept in sync manually since it only bounds a `<=` assertion.
+const MAX_OLD_TOOL_OUTPUT_CHARS_TEST: usize = 4096;
+
+#[test]
+fn age_truncation_preserves_tool_call_pairing() {
+    let items = history_with_twelve_tool_pairs();
+    let messages = responses_proxy::convert::items_to_chat_messages(&items, &test_state());
+    let j = serde_json::to_value(&messages).unwrap();
+
+    let tool_call_ids: Vec<String> = j[1]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tc| tc["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(tool_call_ids.len(), 12);
+
+    for (i, expected_id) in tool_call_ids.iter().enumerate() {
+        let tool_msg = &j[i + 2];
+        assert_eq!(
+            tool_msg["tool_call_id"].as_str().unwrap(),
+            expected_id,
+            "tool message #{i} must pair with the assistant tool_call at the same position, truncated or not"
+        );
+    }
+}
+
+#[test]
+fn hard_budget_applies_on_top_of_age_truncation() {
+    let items = history_with_twelve_tool_pairs();
+    let mut messages = responses_proxy::convert::items_to_chat_messages(&items, &test_state());
+
+    // Snapshot the already age-truncated outputs (the first 4) before the
+    // hard budget runs — they must not be touched again since they are
+    // already <= MAX_OLD_TOOL_OUTPUT_CHARS.
+    let pre_truncated: Vec<String> = messages[2..6]
+        .iter()
+        .map(|m| match m {
+            chat::MessageRequest::Tool(t) => match &t.content {
+                chat::MessageContent::Text(s) => s.clone(),
+                chat::MessageContent::Parts(_) => panic!("expected text content"),
+            },
+            _ => panic!("expected a tool message"),
+        })
+        .collect();
+
+    let total_before: usize = messages
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap().len())
+        .sum();
+    // Small enough to force shrinking several of the still-verbatim last-8
+    // outputs, on top of the age truncation that already ran.
+    let budget = total_before / 2;
+
+    let shrunk = responses_proxy::convert::enforce_input_budget(&mut messages, budget);
+    assert!(shrunk > 0, "hard budget must shrink additional messages");
+
+    let total_after: usize = messages
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap().len())
+        .sum();
+    assert!(total_after < total_before);
+
+    // Already-shrunk age-truncated outputs are left alone by the hard budget.
+    let post_truncated: Vec<String> = messages[2..6]
+        .iter()
+        .map(|m| match m {
+            chat::MessageRequest::Tool(t) => match &t.content {
+                chat::MessageContent::Text(s) => s.clone(),
+                chat::MessageContent::Parts(_) => panic!("expected text content"),
+            },
+            _ => panic!("expected a tool message"),
+        })
+        .collect();
+    assert_eq!(pre_truncated, post_truncated);
+
+    // Pairing survives the hard budget too.
+    let j = serde_json::to_value(&messages).unwrap();
+    let tool_call_ids: Vec<String> = j[1]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tc| tc["id"].as_str().unwrap().to_string())
+        .collect();
+    for (i, expected_id) in tool_call_ids.iter().enumerate() {
+        assert_eq!(j[i + 2]["tool_call_id"].as_str().unwrap(), expected_id);
+    }
+}
