@@ -349,14 +349,13 @@ async fn mcp_namespace_tools_flattened_to_chat_functions() {
 }
 
 #[tokio::test]
-async fn multi_agent_collaboration_tools_dropped() {
-    // gpt-5.6 multi-agent mode delivers the hosted collaboration actions
-    // (spawn_agent, …) inside a `collaboration` namespace. They execute in
-    // OpenAI's hosted Responses runtime, not the client, so a Chat Completions
-    // upstream cannot fulfil them — advertising them lures the model into
-    // `spawn_agent` calls the client rejects as `unsupported call`. They must be
-    // dropped while the client-executable tools (exec/wait/request_user_input)
-    // are kept, so the model falls back to plain single-agent code-mode.
+async fn multi_agent_collaboration_tools_pass_through() {
+    // gpt-5.6 multi-agent mode delivers the collaboration actions
+    // (spawn_agent, …) inside a `collaboration` namespace. Codex CLI has
+    // client-side handlers for these that spawn a local sub-agent thread and
+    // drive it with its own separate upstream calls, so the proxy passes them
+    // through like any other namespace member — same as the plain
+    // client-executable tools (exec/wait/request_user_input).
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.6-sol",
         "input": [
@@ -374,7 +373,9 @@ async fn multi_agent_collaboration_tools_dropped() {
                      "description": "Tools for spawning and managing sub-agents.",
                      "tools": [
                         {"type": "function", "name": "spawn_agent",
-                         "parameters": {"type": "object", "properties": {}}},
+                         "parameters": {"type": "object", "properties": {
+                            "model": {"type": "string"}
+                         }}},
                         {"type": "function", "name": "followup_task",
                          "parameters": {"type": "object", "properties": {}}},
                         {"type": "function", "name": "interrupt_agent",
@@ -399,23 +400,34 @@ async fn multi_agent_collaboration_tools_dropped() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["exec", "wait", "request_user_input"]);
-    for hosted in [
-        "spawn_agent",
-        "followup_task",
-        "interrupt_agent",
-        "list_agents",
-        "send_message",
-        "wait_agent",
-    ] {
-        assert!(!names.contains(&hosted), "{hosted} must be dropped");
-    }
+    assert_eq!(
+        names,
+        vec![
+            "exec",
+            "wait",
+            "request_user_input",
+            "spawn_agent",
+            "followup_task",
+            "interrupt_agent",
+            "list_agents",
+            "send_message",
+            "wait_agent",
+        ]
+    );
+    let spawn_agent = tools
+        .iter()
+        .find(|t| t["function"]["name"] == "spawn_agent")
+        .expect("spawn_agent present");
+    assert_eq!(
+        spawn_agent["function"]["parameters"]["properties"]["model"]["type"], "string",
+        "schema must survive verbatim, not just the name"
+    );
 }
 
 #[tokio::test]
-async fn multi_agent_hosted_action_dropped_outside_collaboration_namespace() {
-    // Defensive: even if a hosted action arrives as a bare top-level tool or in
-    // a differently-named namespace, it must still be dropped by name.
+async fn multi_agent_hosted_action_passes_through_as_plain_function() {
+    // A multi-agent action arriving as a bare top-level tool, or inside a
+    // differently-named namespace, passes through like any other function.
     let req: responses::Request = serde_json::from_value(json!({
         "model": "gpt-5.6-sol",
         "input": [
@@ -445,7 +457,211 @@ async fn multi_agent_hosted_action_dropped_outside_collaboration_namespace() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["keep_me"]);
+    assert_eq!(names, vec!["spawn_agent", "list_agents", "keep_me"]);
+}
+
+#[tokio::test]
+async fn hosted_only_tool_types_still_dropped() {
+    // Regression: genuinely hosted/Responses-only tool types (no Chat
+    // Completions equivalent) must still be dropped — this change only
+    // affects the six named multi-agent actions, not the real catch-all.
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": "hi",
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "web_search"},
+            {"type": "computer_use_preview", "display_width": 1024,
+             "display_height": 768, "environment": "browser"}
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    assert!(
+        j["tools"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "hosted-only tool types must still produce zero Chat tools"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_action_declared_custom_round_trips_as_custom_tool_call() {
+    // If a multi-agent action is ever declared as a Custom tool rather than
+    // Function, its `function_call` must still be remapped back to
+    // `custom_tool_call` on the response side — proving the
+    // `custom_function_names` fix (the fourth call site) actually wires
+    // through end to end, not just that the tool list contains the name.
+    use responses_proxy::types::item::InputItem;
+
+    let input: Vec<InputItem> = serde_json::from_value(json!([
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {"type": "custom", "name": "send_message",
+                 "description": "Send a message to an existing agent."}
+            ]
+        }
+    ]))
+    .unwrap();
+
+    let custom = responses_proxy::convert::custom_tool_names(&input, None, false);
+    assert!(
+        custom.contains("send_message"),
+        "send_message must be tracked as a custom-shaped tool"
+    );
+
+    let chat: chat::Completion = serde_json::from_value(json!({
+        "id": "c", "object": "chat.completion", "created": 1u64, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "send_message", "arguments": "{\"input\":\"hi\"}"}}
+            ]
+        }}]
+    }))
+    .unwrap();
+    let mut resp = chat_to_responses(chat, "gpt-5.6-sol".into(), None);
+    responses_proxy::convert::remap_custom_tool_calls(&mut resp, &custom);
+    let j = serde_json::to_value(&resp).unwrap();
+    let out = j["output"].as_array().unwrap();
+    let send_message = out.iter().find(|i| i["name"] == "send_message").unwrap();
+    assert_eq!(send_message["type"], "custom_tool_call");
+}
+
+#[tokio::test]
+async fn spawn_agent_namespace_tag_restored_on_function_call() {
+    // Chat Completions carries no `namespace` field, so `chat_to_responses`
+    // always emits `namespace: None` for a tool call. `apply_tool_namespaces`
+    // must restore the tag from the request's `namespace` bundle before
+    // Codex's `(name, namespace)`-keyed registry sees it — otherwise it
+    // rejects the call as `"unsupported call: spawn_agent"`.
+    use responses_proxy::types::item::InputItem;
+
+    let input: Vec<InputItem> = serde_json::from_value(json!([
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {"type": "namespace", "name": "collaboration",
+                 "description": "Tools for spawning and managing sub-agents.",
+                 "tools": [
+                    {"type": "function", "name": "spawn_agent",
+                     "parameters": {"type": "object", "properties": {}}}
+                 ]}
+            ]
+        }
+    ]))
+    .unwrap();
+
+    let namespaces = responses_proxy::convert::tool_namespaces(&input, None);
+    assert_eq!(
+        namespaces.get("spawn_agent").map(String::as_str),
+        Some("collaboration")
+    );
+
+    let chat: chat::Completion = serde_json::from_value(json!({
+        "id": "c", "object": "chat.completion", "created": 1u64, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "spawn_agent", "arguments": "{}"}}
+            ]
+        }}]
+    }))
+    .unwrap();
+    let mut resp = chat_to_responses(chat, "gpt-5.6-sol".into(), None);
+    let before = serde_json::to_value(&resp).unwrap();
+    assert_eq!(
+        before["output"][0]["namespace"],
+        serde_json::Value::Null,
+        "chat_to_responses never invents a namespace on its own"
+    );
+
+    responses_proxy::convert::apply_tool_namespaces(&mut resp, &namespaces);
+    let j = serde_json::to_value(&resp).unwrap();
+    assert_eq!(j["output"][0]["namespace"], "collaboration");
+}
+
+#[tokio::test]
+async fn apply_tool_namespaces_is_noop_when_empty() {
+    // Zero regression when the turn declared no `namespace` tools — e.g.
+    // Codex's own multi-agent feature flags are off. `tool_namespaces` is then
+    // empty and every function_call keeps the `namespace: None` it already had.
+    let chat: chat::Completion = serde_json::from_value(json!({
+        "id": "c", "object": "chat.completion", "created": 1u64, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}}
+            ]
+        }}]
+    }))
+    .unwrap();
+    let mut resp = chat_to_responses(chat, "gpt-5.6-sol".into(), None);
+    responses_proxy::convert::apply_tool_namespaces(&mut resp, &std::collections::HashMap::new());
+    let j = serde_json::to_value(&resp).unwrap();
+    assert_eq!(j["output"][0]["namespace"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn tool_namespaces_restored_on_continuation_turn() {
+    // Mirrors `code_mode_tools_restored_on_continuation_turn`: the namespace
+    // map is cached under the response id and restored on a tool-result
+    // continuation that omits `additional_tools`.
+    use responses_proxy::types::item::InputItem;
+    let state = test_state();
+
+    let fresh: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "additional_tools", "role": "developer", "tools": [
+            {"type": "namespace", "name": "collaboration", "tools": [
+                {"type": "function", "name": "spawn_agent",
+                 "parameters": {"type": "object", "properties": {}}}
+            ]}
+        ]}
+    ]))
+    .unwrap();
+    let namespaces =
+        responses_proxy::convert::resolve_tool_namespaces(&state, &fresh, None, None).await;
+    assert_eq!(
+        namespaces.get("spawn_agent").map(String::as_str),
+        Some("collaboration")
+    );
+    state
+        .store()
+        .put_tools(
+            "resp_ns1".to_string(),
+            vec![],
+            std::collections::HashSet::new(),
+            namespaces,
+        )
+        .await;
+
+    let cont: Vec<InputItem> = serde_json::from_value(json!([
+        {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+    ]))
+    .unwrap();
+    let restored =
+        responses_proxy::convert::resolve_tool_namespaces(&state, &cont, None, Some("resp_ns1"))
+            .await;
+    assert_eq!(
+        restored.get("spawn_agent").map(String::as_str),
+        Some("collaboration")
+    );
+
+    // Unknown previous id → no invention, empty map (no regression).
+    let none = responses_proxy::convert::resolve_tool_namespaces(
+        &state,
+        &cont,
+        None,
+        Some("resp_unknown"),
+    )
+    .await;
+    assert!(none.is_empty());
 }
 
 #[tokio::test]
@@ -478,7 +694,12 @@ async fn code_mode_tools_restored_on_continuation_turn() {
     assert!(custom_names1.contains("exec"));
     state
         .store()
-        .put_tools("resp_turn1".to_string(), tools1, custom_names1)
+        .put_tools(
+            "resp_turn1".to_string(),
+            tools1,
+            custom_names1,
+            std::collections::HashMap::new(),
+        )
         .await;
 
     // Turn 2: continuation — no additional_tools, references the prior response.
@@ -528,7 +749,12 @@ async fn resolve_custom_tool_names_falls_back_to_cached() {
     assert!(names.contains("exec"));
     state
         .store()
-        .put_tools("resp_a".to_string(), vec![], names)
+        .put_tools(
+            "resp_a".to_string(),
+            vec![],
+            names,
+            std::collections::HashMap::new(),
+        )
         .await;
 
     // Continuation (no additional_tools) falls back to the cached set.

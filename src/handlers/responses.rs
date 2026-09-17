@@ -153,6 +153,18 @@ pub async fn responses(
         req.previous_response_id.as_deref(),
     )
     .await;
+    // Tool name → namespace name for tools declared inside a Codex `namespace`
+    // bundle (e.g. `spawn_agent` → `"collaboration"`), needed to restore the tag
+    // Chat Completions can't carry on the wire. Empty whenever Codex's own
+    // multi-agent feature flags are off, so this never changes behavior for
+    // sessions that don't use namespace tools.
+    let tool_namespaces = crate::convert::resolve_tool_namespaces(
+        &state,
+        &req.input,
+        req.tools.as_deref(),
+        req.previous_response_id.as_deref(),
+    )
+    .await;
     let (messages_chars, tool_output_chars) = message_size_metrics(&chat_req.messages);
     tracing::info!(
         model = %model,
@@ -198,6 +210,7 @@ pub async fn responses(
         let bg_req = req.clone();
         let bg_rid = response_id.clone();
         let bg_custom_names = custom_names.clone();
+        let bg_tool_namespaces = tool_namespaces.clone();
 
         tokio::spawn(async move {
             let result = execute_upstream_request(
@@ -207,6 +220,7 @@ pub async fn responses(
                 bg_model,
                 &bg_req,
                 &bg_custom_names,
+                &bg_tool_namespaces,
                 truncation_scale,
             )
             .await;
@@ -261,6 +275,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
+            tool_namespaces,
             truncation_scale,
             &ns,
         )
@@ -276,6 +291,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
+            tool_namespaces,
             truncation_scale,
             &ns,
         )
@@ -291,6 +307,7 @@ pub async fn responses(
             full_input_messages,
             response_tools,
             custom_names,
+            tool_namespaces,
             truncation_scale,
             &ns,
         )
@@ -349,6 +366,7 @@ fn send_chat_request(
 
 /// Call upstream Chat API, parse the response, convert to Responses format,
 /// and apply include-based trimming. Does NOT handle persistence or metadata.
+#[allow(clippy::too_many_arguments)]
 async fn execute_upstream_request(
     state: &crate::app::State,
     provider: &crate::config::ResolvedProvider,
@@ -356,6 +374,7 @@ async fn execute_upstream_request(
     model: String,
     original_req: &ResponsesRequest,
     custom_names: &std::collections::HashSet<String>,
+    tool_namespaces: &std::collections::HashMap<String, String>,
     truncation_scale: Option<(u64, u64)>,
 ) -> Result<crate::types::responses::Response, String> {
     let url = format!("{}/chat/completions", provider.base_url);
@@ -406,11 +425,37 @@ async fn execute_upstream_request(
     let mut resp = chat_to_responses(chat_resp, model, state.compact_key());
     super::input_tokens::apply_input_char_scale(resp.usage.as_mut(), truncation_scale);
 
+    // Restore the namespace tag on tools declared inside a Codex `namespace`
+    // bundle before custom-tool remapping copies it onto CustomToolCall items.
+    crate::convert::apply_tool_namespaces(&mut resp, tool_namespaces);
+
     // gpt-5.6 code-mode: map function_call output items back to the
     // custom_tool_call shape Codex expects (no-op for models below 5.6).
     crate::convert::remap_custom_tool_calls(&mut resp, custom_names);
 
     apply_include_filter(&mut resp, &original_req.include);
+
+    for item in &resp.output {
+        match item {
+            crate::types::item::OutputItem::FunctionCall(fc) => {
+                tracing::debug!(
+                    name = %fc.name,
+                    namespace = ?fc.namespace,
+                    call_id = %fc.call_id,
+                    "output function_call"
+                );
+            }
+            crate::types::item::OutputItem::CustomToolCall(ct) => {
+                tracing::debug!(
+                    name = %ct.name,
+                    namespace = ?ct.namespace,
+                    call_id = %ct.call_id,
+                    "output custom_tool_call"
+                );
+            }
+            _ => {}
+        }
+    }
 
     Ok(resp)
 }
@@ -427,6 +472,7 @@ async fn handle_non_streaming(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
     truncation_scale: Option<(u64, u64)>,
     ns: &str,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
@@ -437,6 +483,7 @@ async fn handle_non_streaming(
         model,
         &original_req,
         &custom_names,
+        &tool_namespaces,
         truncation_scale,
     )
     .await
@@ -461,7 +508,12 @@ async fn handle_non_streaming(
         store_messages.extend(items_to_chat_messages(&output_inputs, state));
         state
             .store()
-            .put_tools(resp.id.clone(), response_tools, custom_names)
+            .put_tools(
+                resp.id.clone(),
+                response_tools,
+                custom_names,
+                tool_namespaces,
+            )
             .await;
         state.store().put(resp.id.clone(), store_messages).await;
     }
@@ -502,6 +554,7 @@ async fn handle_streaming(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
     truncation_scale: Option<(u64, u64)>,
     ns: &str,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -563,11 +616,13 @@ async fn handle_streaming(
 
     // Cache alongside the tools so the next continuation restores it too.
     let store_custom_names = custom_names.clone();
+    let store_tool_namespaces = tool_namespaces.clone();
 
     tokio::spawn(async move {
         let mut buf = String::new();
         let mut ss = StreamState::new(rid.clone(), mid.clone(), model.clone());
         ss.custom_tool_names = custom_names;
+        ss.tool_namespaces = tool_namespaces;
         let seq: u64 = 0;
         let mut collected_events: Vec<StreamEvent> = Vec::new();
         let mut cancel_rx = cancel_rx;
@@ -600,6 +655,7 @@ async fn handle_streaming(
                     return;
                 }
             };
+            tracing::debug!("SSE event: {}", prepared.event_type);
             if store_events {
                 collected_events.push(prepared.event);
             }
@@ -615,6 +671,7 @@ async fn handle_streaming(
                 }
             };
             if tx.send(Ok(sse_event)).await.is_err() {
+                tracing::debug!("SSE send failed");
                 store.unregister_cancel_token(&rid).await;
                 return;
             }
@@ -633,7 +690,14 @@ async fn handle_streaming(
                 Some(Ok(b)) => {
                     buf.push_str(&String::from_utf8_lossy(&b));
                 }
-                _ => break,
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "SSE upstream body read error");
+                    break;
+                }
+                None => {
+                    tracing::debug!("SSE upstream body ended");
+                    break;
+                }
             }
 
             // Parse SSE events (delimited by \n\n)
@@ -656,6 +720,10 @@ async fn handle_streaming(
                     ) {
                         Ok(events) => {
                             for prepared in events {
+                                if !prepared.event_type.ends_with("delta") {
+                                    tracing::debug!("SSE event: {}", prepared.event_type);
+                                    tracing::debug!("SSE event details: {}", prepared.body);
+                                }
                                 if store_events {
                                     collected_events.push(prepared.event);
                                 }
@@ -671,6 +739,7 @@ async fn handle_streaming(
                                     }
                                 };
                                 if tx.send(Ok(sse_event)).await.is_err() {
+                                    tracing::debug!("SSE send failed");
                                     // Client disconnected — persist partial events and exit
                                     if store_events && !collected_events.is_empty() {
                                         let final_resp = build_response_from_state(&ss);
@@ -682,6 +751,7 @@ async fn handle_streaming(
                                                 rid.clone(),
                                                 response_tools.clone(),
                                                 store_custom_names.clone(),
+                                                store_tool_namespaces.clone(),
                                             )
                                             .await;
                                         store.put(rid.clone(), msgs).await;
@@ -758,6 +828,7 @@ async fn handle_streaming(
                     rid.clone(),
                     response_tools.clone(),
                     store_custom_names.clone(),
+                    store_tool_namespaces.clone(),
                 )
                 .await;
             store.put(rid.clone(), msgs).await;
@@ -785,6 +856,7 @@ async fn handle_streaming_structured(
     full_input_messages: Vec<crate::types::chat::MessageRequest>,
     response_tools: Vec<crate::types::chat::ToolRequest>,
     custom_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
     truncation_scale: Option<(u64, u64)>,
     ns: &str,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -800,6 +872,7 @@ async fn handle_streaming_structured(
         model,
         &original_req,
         &custom_names,
+        &tool_namespaces,
         truncation_scale,
     )
     .await
@@ -817,7 +890,12 @@ async fn handle_streaming_structured(
         store_messages.extend(items_to_chat_messages(&output_inputs, state));
         state
             .store()
-            .put_tools(resp.id.clone(), response_tools, custom_names)
+            .put_tools(
+                resp.id.clone(),
+                response_tools,
+                custom_names,
+                tool_namespaces,
+            )
             .await;
         state.store().put(resp.id.clone(), store_messages).await;
     }
@@ -841,6 +919,8 @@ async fn handle_streaming_structured(
                 let err = Error::server_error(msg);
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
             })?;
+        tracing::debug!("SSE event (structured): {}", prepared.event_type);
+        tracing::debug!("SSE event details (structured): {}", prepared.body);
         let sse_event = SseEvent::default()
             .event(prepared.event_type)
             .json_data(prepared.body)
@@ -849,6 +929,7 @@ async fn handle_streaming_structured(
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(err.to_http_json()))
             })?;
         if tx.send(Ok(sse_event)).await.is_err() {
+            tracing::debug!("SSE send failed (structured)");
             break;
         }
     }
@@ -1211,7 +1292,7 @@ pub(crate) fn build_response_from_state(ss: &StreamState) -> crate::types::respo
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
             id: Some(tc.fc_id.clone()),
-            namespace: None,
+            namespace: tc.namespace.clone(),
             status: Some("completed".into()),
         }));
     }

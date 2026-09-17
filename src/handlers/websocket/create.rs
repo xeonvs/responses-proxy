@@ -121,6 +121,19 @@ pub(super) async fn handle(
     .await;
     // Cache alongside the tools so the next continuation restores it too.
     let stored_custom_names = custom_names.clone();
+    // Tool name → namespace name for tools declared inside a Codex `namespace`
+    // bundle (e.g. `spawn_agent` → `"collaboration"`), needed to restore the tag
+    // Chat Completions can't carry on the wire. Empty whenever Codex's own
+    // multi-agent feature flags are off, so this never changes behavior for
+    // sessions that don't use namespace tools.
+    let tool_namespaces = crate::convert::resolve_tool_namespaces(
+        state,
+        &req.input,
+        req.tools.as_deref(),
+        req.previous_response_id.as_deref(),
+    )
+    .await;
+    let stored_tool_namespaces = tool_namespaces.clone();
 
     // Convert to Chat API (responses_to_chat handles history + instructions)
     let mut chat_req = match responses_to_chat(req, state).await {
@@ -239,7 +252,12 @@ pub(super) async fn handle(
 
         state
             .store()
-            .put_tools(rid.clone(), response_tools, stored_custom_names)
+            .put_tools(
+                rid.clone(),
+                response_tools,
+                stored_custom_names,
+                stored_tool_namespaces,
+            )
             .await;
         state.store().put(rid, full_input_messages).await;
         return;
@@ -266,7 +284,9 @@ pub(super) async fn handle(
             full_input_messages,
             response_tools,
             stored_custom_names,
+            stored_tool_namespaces,
             custom_names,
+            tool_namespaces,
             truncation_scale,
         )
         .await;
@@ -394,6 +414,7 @@ pub(super) async fn handle(
         now,
         compact_key: state.compact_key(),
         custom_tool_names: custom_names,
+        tool_namespaces,
         truncation_scale,
     };
     let (response_msg, cancelled, stream_events) =
@@ -426,7 +447,12 @@ pub(super) async fn handle(
         full_input_messages.push(assistant_msg);
         state
             .store()
-            .put_tools(rid.clone(), response_tools, stored_custom_names)
+            .put_tools(
+                rid.clone(),
+                response_tools,
+                stored_custom_names,
+                stored_tool_namespaces,
+            )
             .await;
         state.store().put(rid, full_input_messages).await;
     }
@@ -443,6 +469,7 @@ struct WsStreamContext<'a> {
     now: i64,
     compact_key: Option<&'a [u8; 32]>,
     custom_tool_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
     truncation_scale: Option<(u64, u64)>,
 }
 
@@ -462,6 +489,7 @@ async fn run_stream(
     ss.created = context.now;
     ss.compact_key = context.compact_key.copied();
     ss.custom_tool_names = context.custom_tool_names;
+    ss.tool_namespaces = context.tool_namespaces;
     ss.truncation_scale = context.truncation_scale;
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
@@ -703,7 +731,9 @@ async fn stream_structured_buffered(
     mut full_input_messages: Vec<MessageRequest>,
     response_tools: Vec<chat::ToolRequest>,
     stored_custom_names: std::collections::HashSet<String>,
+    stored_tool_namespaces: std::collections::HashMap<String, String>,
     custom_names: std::collections::HashSet<String>,
+    tool_namespaces: std::collections::HashMap<String, String>,
     truncation_scale: Option<(u64, u64)>,
 ) {
     chat_req.stream = Some(false);
@@ -773,6 +803,7 @@ async fn stream_structured_buffered(
     let mut resp = crate::convert::chat_to_responses(chat_resp, model, state.compact_key());
     resp.id = rid.clone();
     crate::handlers::apply_input_char_scale(resp.usage.as_mut(), truncation_scale);
+    crate::convert::apply_tool_namespaces(&mut resp, &tool_namespaces);
     crate::convert::remap_custom_tool_calls(&mut resp, &custom_names);
 
     // Compute persisted history before `resp` is consumed by event synthesis.
@@ -800,7 +831,12 @@ async fn stream_structured_buffered(
     full_input_messages.extend(stored_output);
     state
         .store()
-        .put_tools(rid.clone(), response_tools, stored_custom_names)
+        .put_tools(
+            rid.clone(),
+            response_tools,
+            stored_custom_names,
+            stored_tool_namespaces,
+        )
         .await;
     state.store().put(rid, full_input_messages).await;
 }

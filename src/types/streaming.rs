@@ -24,7 +24,7 @@ use super::event;
 pub use super::event::StreamEvent;
 use super::item::{self, OutputContentBlock, OutputItem, ReasoningTextPart};
 use super::responses::{Response, ResponseStatus};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ── Streaming accumulator ────────────────────────────────────────────────
 
@@ -59,6 +59,15 @@ pub struct StreamState {
     /// as `function` calls; for these names the client-facing events are emitted
     /// as `custom_tool_call` instead (see [`emit_tool_call_deltas`]).
     pub custom_tool_names: HashSet<String>,
+    /// Tool name → namespace name for tools declared inside a Codex `namespace`
+    /// bundle (e.g. `spawn_agent` → `"collaboration"`). Chat Completions carries
+    /// no namespace field, so this is threaded separately and re-attached to
+    /// the `function_call`/`custom_tool_call` events emitted for these names
+    /// (see [`emit_tool_call_deltas`]) — otherwise Codex's `(name, namespace)`-
+    /// keyed registry rejects the call as `"unsupported call: <name>"`. Empty
+    /// whenever the turn declared no `namespace` tools, e.g. when Codex's own
+    /// multi-agent feature flags are off.
+    pub tool_namespaces: HashMap<String, String>,
     /// Truncation char-scale `(full_chars, sent_chars)` applied to the reported
     /// `usage` before it reaches Codex. Codex gates auto-compaction on the
     /// reported `total_tokens`, so when history is truncated we scale the count
@@ -77,6 +86,8 @@ pub struct ToolCallAccumulator {
     pub output_index: i64,
     /// True when this tool name is in [`StreamState::custom_tool_names`].
     pub is_custom: bool,
+    /// Namespace name if this tool name is in [`StreamState::tool_namespaces`].
+    pub namespace: Option<String>,
 }
 
 impl StreamState {
@@ -513,7 +524,7 @@ pub fn unwrap_custom_input(arguments: &str) -> String {
 fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent> {
     // Copy the fields we need in a scoped borrow so the mutable `next_seq` /
     // `completed_items` calls below don't conflict with the tool_calls borrow.
-    let (id, name, arguments, output_index, fc_id_raw, is_custom) = {
+    let (id, name, arguments, output_index, fc_id_raw, is_custom, namespace) = {
         let tc = &state.tool_calls[idx];
         (
             tc.id.clone(),
@@ -522,6 +533,7 @@ fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent>
             tc.output_index,
             tc.fc_id.clone(),
             tc.is_custom,
+            tc.namespace.clone(),
         )
     };
     let mut events = Vec::new();
@@ -564,7 +576,7 @@ fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent>
                 input,
                 name: name.clone(),
                 id: Some(item_id),
-                namespace: None,
+                namespace: namespace.clone(),
             }),
             sequence_number: next_seq(state),
         }));
@@ -578,7 +590,7 @@ fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent>
                 name,
                 arguments,
                 id: None,
-                namespace: None,
+                namespace,
                 status: Some("completed".into()),
             }));
         return events;
@@ -600,7 +612,7 @@ fn close_tool_call_item(state: &mut StreamState, idx: usize) -> Vec<StreamEvent>
         name,
         arguments,
         id: Some(item_id),
-        namespace: None,
+        namespace,
         status: Some("completed".into()),
     });
     events.push(StreamEvent::OutputItemDone(event::OutputItemDone {
@@ -765,7 +777,7 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
             id: Some(fc_id),
-            namespace: None,
+            namespace: tc.namespace.clone(),
             status: Some("completed".into()),
         }));
     }
@@ -1021,9 +1033,19 @@ fn emit_tool_call_deltas(
                 .map(|n| state.custom_tool_names.contains(n))
                 .unwrap_or(false);
 
+        // Same reasoning for the namespace tag: resolve from the (possibly
+        // newly arriving) name, falling back to what the slot already has.
+        let namespace = tc
+            .function
+            .as_ref()
+            .and_then(|f| f.name.as_deref())
+            .and_then(|n| state.tool_namespaces.get(n).cloned())
+            .or_else(|| state.tool_calls[idx].namespace.clone());
+
         // Now borrow the slot
         let slot = &mut state.tool_calls[idx];
         slot.is_custom = is_custom;
+        slot.namespace = namespace.clone();
 
         // Capture id / name on first appearance
         if let Some(ref id) = tc.id {
@@ -1053,7 +1075,7 @@ fn emit_tool_call_deltas(
                     input: String::new(),
                     name: slot.name.clone(),
                     id: Some(item_id),
-                    namespace: None,
+                    namespace: namespace.clone(),
                 })
             } else {
                 OutputItem::FunctionCall(item::FunctionCall {
@@ -1061,7 +1083,7 @@ fn emit_tool_call_deltas(
                     name: slot.name.clone(),
                     arguments: String::new(),
                     id: Some(item_id),
-                    namespace: None,
+                    namespace: namespace.clone(),
                     status: Some("in_progress".into()),
                 })
             };

@@ -31,7 +31,7 @@ codex review # 使用 codex-auto-review 模型（如已配置）
 `openai_base_url` 是全局设置。如果想按会话在代理与其他后端之间切换，可以定义一个
 provider，并用 `codex --profile <name>` 选择对应 profile。
 
-在 `~/.codex/config.toml` 中声明 provider，并禁用全局子代理功能开关：
+在 `~/.codex/config.toml` 中声明 provider：
 
 ```toml
 [model_providers.responses_proxy]
@@ -39,15 +39,28 @@ name = "responses-proxy (local)"
 base_url = "http://localhost:3000/v1"
 # wire_api 默认为 "responses"（正是代理所说的协议）；除非在 config.yaml 中启用
 # server.auth.keys，否则无需 env_key。
-
-# gpt-5.6 的托管子代理（multi-agent）运行在该模型的托管运行时中，无法通过 Chat
-# Completions 执行——请禁用它们。这些是全局功能开关，并非 per-profile。
-[features]
-multi_agent = false
-
-[features.multi_agent_v2]
-enabled = false
 ```
+
+> **子代理（`features.multi_agent` / `features.multi_agent_v2`）**是 Codex
+> 本地的 `Experimental`（实验性）功能：由 Codex 自身的客户端线程管理器驱动，
+> 会在本地派生一个子代理线程，并为该线程单独发起一次上游 Chat Completions
+> 调用。代理（proxy）并不参与编排这一切——它只是像转发其他工具一样，原样转发
+> `spawn_agent`/`send_message`/… 这些工具定义与调用，并恢复 Chat Completions
+> 协议本身不携带的 `namespace` 标记，好让 Codex 自身按 `(name, namespace)`
+> 路由调用时能够识别，而不是拒绝为 `unsupported call`。启用这些开关意味着你在
+> 使用上游的实验性行为，其表现可能独立于本代理发生变化甚至失效。
+>
+> **如果子代理出现问题，把开关关掉即可**——这是 Codex 一侧的设置，本代理并不
+> 控制它：
+> ```toml
+> [features]
+> multi_agent = false
+>
+> [features.multi_agent_v2]
+> enabled = false
+> ```
+> 两者都关闭后，Codex 就不会再下发 `collaboration` 工具集，代理的 namespace
+> 处理逻辑自然变成空操作——不影响其他任何行为。
 
 Codex ≥ 0.134 不再读取内联的 `[profiles.<name>]` 表——请把 profile 放到独立的
 overlay 文件 `~/.codex/<name>.config.toml` 中，使用顶层键（其余设置，包括
