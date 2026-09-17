@@ -752,63 +752,14 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
         events.extend(close_message_item(state));
     }
 
-    // Collect output items — mid-stream closed items + any still in progress
-    let mut output_items: Vec<OutputItem> = state.completed_items.clone();
-
-    if !state.reasoning_content.is_empty() {
-        output_items.push(OutputItem::Reasoning(build_reasoning_item(
-            state.reasoning_id.clone(),
-            &state.reasoning_content,
-            state.compact_key.as_ref(),
-        )));
-    }
-
-    for tc in &state.tool_calls {
-        if tc.id.is_empty() {
-            continue;
-        }
-        let fc_id = if tc.fc_id.is_empty() {
-            format!("fc_{}", uuid::Uuid::new_v4().to_string().replace('-', ""))
-        } else {
-            tc.fc_id.clone()
-        };
-        output_items.push(OutputItem::FunctionCall(item::FunctionCall {
-            call_id: tc.id.clone(),
-            name: tc.name.clone(),
-            arguments: tc.arguments.clone(),
-            id: Some(fc_id),
-            namespace: tc.namespace.clone(),
-            status: Some("completed".into()),
-        }));
-    }
-
-    if !state.accumulated_text.is_empty() {
-        let item_logprobs = if state.text_logprobs.is_empty() {
-            None
-        } else {
-            Some(state.text_logprobs.clone())
-        };
-        let msg_content = if state.accumulated_text.is_empty() {
-            vec![]
-        } else if state.has_refusal {
-            vec![OutputContentBlock::Refusal {
-                refusal: state.accumulated_text.clone(),
-            }]
-        } else {
-            vec![OutputContentBlock::Text {
-                text: state.accumulated_text.clone(),
-                annotations: vec![],
-                logprobs: item_logprobs,
-            }]
-        };
-        output_items.push(OutputItem::Message(item::OutputMessage {
-            id: state.msg_id.clone(),
-            role: "assistant".into(),
-            status: "completed".into(),
-            content: msg_content,
-            phase: None,
-        }));
-    }
+    // `close_*_item` above already pushed every still-open item into
+    // completed_items (in the right order), so it's the full output. Note:
+    // don't re-derive output items from `state`'s accumulators here even
+    // though they're still populated (intentionally not cleared — callers
+    // like the compaction path read `accumulated_text`/`reasoning_content`
+    // straight off the drained `StreamState` after this returns) — re-adding
+    // from them duplicates every item `close_*_item` already recorded.
+    let output_items: Vec<OutputItem> = state.completed_items.clone();
 
     // ── Build final Response ──────────────────────────────────────────────
     let (final_status, incomplete_details) = match state.finish_reason.as_deref() {

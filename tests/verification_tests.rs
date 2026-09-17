@@ -1513,6 +1513,41 @@ async fn s12_streaming_usage_captured() {
     );
 }
 
+// Regression: a tool call that's still open when the stream ends (the model's
+// last action in the turn, no trailing text/reasoning to trigger a mid-stream
+// close) must appear exactly once in the final `response.completed` output —
+// not once from the "close still-open items" step and once more from a
+// leftover re-derivation off the same accumulator.
+#[tokio::test]
+async fn streaming_trailing_tool_call_not_duplicated_in_completed_output() {
+    let mut state = StreamState::new("resp_test".into(), "msg_test".into(), "gpt-5.6-sol".into());
+
+    process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"t","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"spawn_agent","arguments":""}}]}}]}"#).unwrap(),
+    );
+
+    let events = build_completion_events(&mut state);
+    let completed = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Completed(v) => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    let j = serde_json::to_value(completed).unwrap();
+    let output = j["response"]["output"].as_array().unwrap();
+    let function_calls: Vec<_> = output
+        .iter()
+        .filter(|o| o["type"] == "function_call")
+        .collect();
+    assert_eq!(
+        function_calls.len(),
+        1,
+        "spawn_agent must appear exactly once, got: {output:?}"
+    );
+}
+
 // ── Scenario 13: Streaming output_index no duplicates ────────────────
 
 #[tokio::test]
