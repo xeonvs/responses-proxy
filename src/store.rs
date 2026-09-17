@@ -27,6 +27,13 @@ struct StoredTools {
     /// Needed to re-emit the model's `function_call` as the `custom_tool_call`
     /// shape Codex expects; without it Codex cancels the call it didn't declare.
     custom_names: std::collections::HashSet<String>,
+    /// Maps tool name → namespace name for tools declared inside a Codex
+    /// `namespace` bundle (e.g. `spawn_agent` → `"collaboration"`). Needed to
+    /// restore the `namespace` tag Chat Completions can't carry on the wire;
+    /// without it Codex's `(name, namespace)`-keyed registry rejects the call
+    /// as `"unsupported call: <name>"`. Empty whenever no namespace tools were
+    /// declared, e.g. when Codex's own multi-agent feature flags are off.
+    tool_namespaces: std::collections::HashMap<String, String>,
     created_at: Instant,
 }
 
@@ -104,16 +111,17 @@ impl Store {
         }
     }
 
-    /// Cache the gpt-5.6 code-mode tool registry and its custom-tool name set for
-    /// a response ID. No-op when both are empty so non-code-mode turns don't
-    /// allocate entries.
+    /// Cache the gpt-5.6 code-mode tool registry, its custom-tool name set, and
+    /// its tool→namespace map for a response ID. No-op when all three are empty
+    /// so non-code-mode turns don't allocate entries.
     pub async fn put_tools(
         &self,
         id: String,
         tools: Vec<ToolRequest>,
         custom_names: std::collections::HashSet<String>,
+        tool_namespaces: std::collections::HashMap<String, String>,
     ) {
-        if tools.is_empty() && custom_names.is_empty() {
+        if tools.is_empty() && custom_names.is_empty() && tool_namespaces.is_empty() {
             return;
         }
         self.tools.write().await.insert(
@@ -121,6 +129,7 @@ impl Store {
             StoredTools {
                 tools,
                 custom_names,
+                tool_namespaces,
                 created_at: Instant::now(),
             },
         );
@@ -146,6 +155,22 @@ impl Store {
         let entry = g.get(id)?;
         if entry.created_at.elapsed() <= self.ttl {
             return Some(entry.custom_names.clone());
+        }
+        drop(g);
+        self.tools.write().await.remove(id);
+        None
+    }
+
+    /// Retrieve the cached tool→namespace map by ID. Returns None if not found
+    /// or expired.
+    pub async fn get_tool_namespaces(
+        &self,
+        id: &str,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let g = self.tools.read().await;
+        let entry = g.get(id)?;
+        if entry.created_at.elapsed() <= self.ttl {
+            return Some(entry.tool_namespaces.clone());
         }
         drop(g);
         self.tools.write().await.remove(id);

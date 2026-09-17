@@ -32,8 +32,7 @@ codex review # uses codex-auto-review model (if configured)
 per session instead, define a provider and select a profile with
 `codex --profile <name>`.
 
-In `~/.codex/config.toml`, declare the provider and disable the global
-sub-agent feature flags:
+In `~/.codex/config.toml`, declare the provider:
 
 ```toml
 [model_providers.responses_proxy]
@@ -41,16 +40,31 @@ name = "responses-proxy (local)"
 base_url = "http://localhost:3000/v1"
 # wire_api defaults to "responses" (what the proxy speaks); no env_key needed
 # unless you enable server.auth.keys in config.yaml.
-
-# gpt-5.6 hosted sub-agents (multi-agent) run in the model's hosted runtime and
-# are not executable over Chat Completions — disable them. These are GLOBAL
-# feature flags, not per-profile.
-[features]
-multi_agent = false
-
-[features.multi_agent_v2]
-enabled = false
 ```
+
+> **Sub-agents (`features.multi_agent` / `features.multi_agent_v2`)** are
+> Codex-local, `Experimental`-stage features: Codex's own client-side thread
+> manager drives them, spawning a local sub-agent thread and making its own
+> separate upstream Chat Completions call per thread. The proxy does not
+> orchestrate any of this — it just passes the `spawn_agent`/`send_message`/…
+> tool definitions and calls through like any other tool, restoring the
+> `namespace` tag Chat Completions has no wire field for so Codex's own
+> `(name, namespace)`-keyed call routing accepts them instead of rejecting
+> them as `unsupported call`. Enabling these flags means opting into
+> upstream-experimental behavior that can change or break independent of
+> this proxy.
+>
+> **Having trouble with sub-agents? Turn the flags back off** — this is a
+> Codex-side setting, not something the proxy controls:
+> ```toml
+> [features]
+> multi_agent = false
+>
+> [features.multi_agent_v2]
+> enabled = false
+> ```
+> With both off, Codex never advertises the `collaboration` tools and the
+> proxy's namespace handling is simply a no-op — no other behavior changes.
 
 Codex ≥ 0.134 no longer reads inline `[profiles.<name>]` tables — put the
 profile in its own overlay file at `~/.codex/<name>.config.toml` with top-level

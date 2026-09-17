@@ -184,6 +184,45 @@ pub fn chat_to_responses(
     }
 }
 
+/// Post-process a converted (non-streaming) response: tag `function_call`/
+/// `custom_tool_call` output items whose name belongs to a Codex `namespace`
+/// tool bundle (e.g. `spawn_agent` in `"collaboration"`) with that bundle's
+/// name. Chat Completions carries no namespace field, so [`chat_to_responses`]
+/// always emits `namespace: None`; Codex's own tool-call registry is keyed by
+/// `(name, namespace)` and rejects the call as `"unsupported call: <name>"`
+/// without this tag restored.
+///
+/// Must run before [`remap_custom_tool_calls`], which copies `fc.namespace`
+/// onto the `CustomToolCall` it builds.
+///
+/// No-op when `namespaces` is empty — i.e. whenever the current turn (and its
+/// cached fallback) carried no `namespace` tool, which includes every Codex
+/// session with its own multi-agent feature flags turned off. Zero regression
+/// in that case: every affected item keeps the `namespace: None` it already had.
+pub fn apply_tool_namespaces(
+    resp: &mut responses::Response,
+    namespaces: &std::collections::HashMap<String, String>,
+) {
+    if namespaces.is_empty() {
+        return;
+    }
+    for item in &mut resp.output {
+        match item {
+            OutputItem::FunctionCall(fc) => {
+                if let Some(ns) = namespaces.get(&fc.name) {
+                    fc.namespace = Some(ns.clone());
+                }
+            }
+            OutputItem::CustomToolCall(ct) => {
+                if let Some(ns) = namespaces.get(&ct.name) {
+                    ct.namespace = Some(ns.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Post-process a converted (non-streaming) response: for tool calls whose name
 /// Codex declared as `custom` (code-mode), rewrite the emitted `function_call`
 /// output item into the `custom_tool_call` shape Codex expects, unwrapping the
