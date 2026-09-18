@@ -1019,19 +1019,54 @@ pub fn enforce_message_budget(
     removed
 }
 
+/// Namespace names Codex uses for its own tools (as opposed to MCP/app-registry
+/// tools flattened into a namespace bundle by [`tool_request_to_chat_tools`]).
+/// Sourced from [`tool_namespaces`]'s member→namespace map. May need extending
+/// if Codex introduces new core-tool namespace bundles.
+const CODEX_OWNED_NAMESPACES: &[&str] = &["shell", "collaboration"];
+
 /// Cap the number of tools forwarded to the upstream. Some gateways reject a
 /// request carrying more than a fixed number of tools (e.g. Codex code mode can
 /// flatten a large MCP/app-tool registry into hundreds of functions). When the
-/// converted list exceeds `max`, keep the leading tools — Codex orders its core
-/// coding tools (apply_patch, exec_command, update_plan, …) first — and drop the
-/// overflow, returning the dropped names for logging. No-op when `max` is 0 or
-/// the list already fits.
-pub fn enforce_tool_budget(tools: &mut Vec<chat::ToolRequest>, max: usize) -> Vec<String> {
+/// converted list exceeds `max`, prefer keeping Codex's own tools over
+/// MCP-sourced ones: a tool is "protected" if `namespaces` has no entry for it
+/// (declared directly by Codex, not inside a namespace bundle) or its namespace
+/// is in [`CODEX_OWNED_NAMESPACES`]; everything else is dropped first. Only
+/// reaches into the protected set if it alone still exceeds `max`, in which
+/// case this degrades to a plain tail-cut. Original relative order is preserved
+/// among survivors either way. Returns the dropped names (original order) for
+/// logging. No-op when `max` is 0 or the list already fits.
+pub fn enforce_tool_budget(
+    tools: &mut Vec<chat::ToolRequest>,
+    max: usize,
+    namespaces: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
     if max == 0 || tools.len() <= max {
         return Vec::new();
     }
-    let dropped: Vec<String> = tools[max..].iter().map(chat_tool_name).collect();
-    tools.truncate(max);
+    let tier = |t: &chat::ToolRequest| -> u8 {
+        match namespaces.get(&chat_tool_name(t)) {
+            None => 0,
+            Some(ns) if CODEX_OWNED_NAMESPACES.contains(&ns.as_str()) => 0,
+            Some(_) => 1,
+        }
+    };
+    let mut order: Vec<usize> = (0..tools.len()).collect();
+    order.sort_by_key(|&i| tier(&tools[i]));
+    let keep: std::collections::HashSet<usize> = order.into_iter().take(max).collect();
+    let dropped: Vec<String> = tools
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !keep.contains(i))
+        .map(|(_, t)| chat_tool_name(t))
+        .collect();
+    let mut kept = Vec::with_capacity(max);
+    for (i, t) in tools.drain(..).enumerate() {
+        if keep.contains(&i) {
+            kept.push(t);
+        }
+    }
+    *tools = kept;
     dropped
 }
 

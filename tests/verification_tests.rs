@@ -860,25 +860,29 @@ async fn top_level_code_mode_tools_converted_and_dropped() {
     assert!(!custom.contains("mcp__gh__list"));
 }
 
+fn make_tool(name: &str) -> chat::ToolRequest {
+    chat::ToolRequest::Function {
+        function: chat::FunctionTool {
+            name: name.to_string(),
+            description: None,
+            parameters: None,
+            strict: None,
+        },
+    }
+}
+
 #[test]
 fn enforce_tool_budget_caps_and_reports_overflow() {
-    let mut tools: Vec<chat::ToolRequest> = (0..10)
-        .map(|i| chat::ToolRequest::Function {
-            function: chat::FunctionTool {
-                name: format!("tool_{i}"),
-                description: None,
-                parameters: None,
-                strict: None,
-            },
-        })
-        .collect();
+    let mut tools: Vec<chat::ToolRequest> =
+        (0..10).map(|i| make_tool(&format!("tool_{i}"))).collect();
+    let namespaces = std::collections::HashMap::new();
 
     // 0 disables the cap.
-    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 0).is_empty());
+    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 0, &namespaces).is_empty());
     assert_eq!(tools.len(), 10);
 
-    // Cap keeps the leading tools and reports the dropped tail.
-    let dropped = responses_proxy::convert::enforce_tool_budget(&mut tools, 4);
+    // No namespace info at all → degrades to plain tail-cut, unchanged from before.
+    let dropped = responses_proxy::convert::enforce_tool_budget(&mut tools, 4, &namespaces);
     assert_eq!(tools.len(), 4);
     assert_eq!(
         dropped,
@@ -886,8 +890,73 @@ fn enforce_tool_budget_caps_and_reports_overflow() {
     );
 
     // Already fits → no-op.
-    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 4).is_empty());
+    assert!(responses_proxy::convert::enforce_tool_budget(&mut tools, 4, &namespaces).is_empty());
     assert_eq!(tools.len(), 4);
+}
+
+#[test]
+fn enforce_tool_budget_prefers_codex_owned_tools_over_namespaced_ones() {
+    // Order deliberately interleaves bare/Codex-owned and MCP-ish tools so a
+    // plain tail-cut would drop some of the bare ones — this test proves the
+    // namespace-aware priority overrides that positional behavior.
+    let mut tools: Vec<chat::ToolRequest> = vec![
+        make_tool("mcp_tool_1"),
+        make_tool("exec"),
+        make_tool("mcp_tool_2"),
+        make_tool("spawn_agent"),
+        make_tool("weird_namespace_tool"),
+        make_tool("wait"),
+    ];
+    let mut namespaces = std::collections::HashMap::new();
+    namespaces.insert("mcp_tool_1".to_string(), "mcp".to_string());
+    namespaces.insert("mcp_tool_2".to_string(), "mcp".to_string());
+    namespaces.insert("spawn_agent".to_string(), "collaboration".to_string());
+    namespaces.insert(
+        "weird_namespace_tool".to_string(),
+        "some_unknown_app".to_string(),
+    );
+    // "exec" and "wait" have no entry at all — bare Codex core tools.
+
+    let dropped = responses_proxy::convert::enforce_tool_budget(&mut tools, 3, &namespaces);
+
+    // All three prunable (namespaced, non-Codex-owned) tools are dropped, in
+    // their original relative order, regardless of where they sat in the list.
+    assert_eq!(
+        dropped,
+        vec!["mcp_tool_1", "mcp_tool_2", "weird_namespace_tool"]
+    );
+    // Survivors are exactly the bare + "collaboration" tools, in original order.
+    let kept: Vec<String> = tools.iter().map(chat_tool_name_for_test).collect();
+    assert_eq!(kept, vec!["exec", "spawn_agent", "wait"]);
+}
+
+#[test]
+fn enforce_tool_budget_falls_back_to_tail_cut_when_protected_set_overflows() {
+    // Every tool here is protected (bare or a Codex-owned namespace) — there's
+    // nothing prunable to sacrifice, so this must behave exactly like the old
+    // plain tail-cut instead of refusing to drop anything.
+    let mut tools: Vec<chat::ToolRequest> = vec![
+        make_tool("exec"),
+        make_tool("wait"),
+        make_tool("spawn_agent"),
+        make_tool("send_message"),
+    ];
+    let mut namespaces = std::collections::HashMap::new();
+    namespaces.insert("spawn_agent".to_string(), "collaboration".to_string());
+    namespaces.insert("send_message".to_string(), "collaboration".to_string());
+
+    let dropped = responses_proxy::convert::enforce_tool_budget(&mut tools, 2, &namespaces);
+
+    assert_eq!(dropped, vec!["spawn_agent", "send_message"]);
+    let kept: Vec<String> = tools.iter().map(chat_tool_name_for_test).collect();
+    assert_eq!(kept, vec!["exec", "wait"]);
+}
+
+fn chat_tool_name_for_test(t: &chat::ToolRequest) -> String {
+    match t {
+        chat::ToolRequest::Function { function } => function.name.clone(),
+        chat::ToolRequest::Custom { custom } => custom.name.clone(),
+    }
 }
 
 #[tokio::test]

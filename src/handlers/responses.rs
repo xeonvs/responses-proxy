@@ -121,6 +121,20 @@ pub async fn responses(
         let input_msgs = cr.messages.clone();
         (cr, input_msgs, truncation_scale)
     };
+    // Tool name → namespace name for tools declared inside a Codex `namespace`
+    // bundle (e.g. `spawn_agent` → `"collaboration"`), needed to restore the tag
+    // Chat Completions can't carry on the wire. Empty whenever Codex's own
+    // multi-agent feature flags are off, so this never changes behavior for
+    // sessions that don't use namespace tools. Computed before the max-tools
+    // check below so it can also prioritize Codex's own namespaced tools over
+    // MCP-sourced ones when the budget forces a drop.
+    let tool_namespaces = crate::convert::resolve_tool_namespaces(
+        &state,
+        &req.input,
+        req.tools.as_deref(),
+        req.previous_response_id.as_deref(),
+    )
+    .await;
     // Cap the tool list before caching/forwarding: some gateways reject requests
     // carrying more than a fixed number of tools, and Codex code mode can flatten
     // a large MCP/app-tool registry into hundreds of functions. Applied here so
@@ -128,7 +142,8 @@ pub async fn responses(
     if provider.max_tools > 0
         && let Some(tools) = chat_req.tools.as_mut()
     {
-        let dropped = crate::convert::enforce_tool_budget(tools, provider.max_tools);
+        let dropped =
+            crate::convert::enforce_tool_budget(tools, provider.max_tools, &tool_namespaces);
         if !dropped.is_empty() {
             tracing::warn!(
                 max_tools = provider.max_tools,
@@ -147,18 +162,6 @@ pub async fn responses(
     // response on a continuation turn (see the helper) — otherwise `exec`
     // returns as a `function_call` Codex cancels before it runs.
     let custom_names = crate::convert::resolve_custom_tool_names(
-        &state,
-        &req.input,
-        req.tools.as_deref(),
-        req.previous_response_id.as_deref(),
-    )
-    .await;
-    // Tool name → namespace name for tools declared inside a Codex `namespace`
-    // bundle (e.g. `spawn_agent` → `"collaboration"`), needed to restore the tag
-    // Chat Completions can't carry on the wire. Empty whenever Codex's own
-    // multi-agent feature flags are off, so this never changes behavior for
-    // sessions that don't use namespace tools.
-    let tool_namespaces = crate::convert::resolve_tool_namespaces(
         &state,
         &req.input,
         req.tools.as_deref(),
