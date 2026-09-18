@@ -193,7 +193,8 @@ pub(super) async fn handle(
     if provider.max_tools > 0
         && let Some(tools) = chat_req.tools.as_mut()
     {
-        let dropped = crate::convert::enforce_tool_budget(tools, provider.max_tools);
+        let dropped =
+            crate::convert::enforce_tool_budget(tools, provider.max_tools, &tool_namespaces);
         if !dropped.is_empty() {
             tracing::warn!(
                 max_tools = provider.max_tools,
