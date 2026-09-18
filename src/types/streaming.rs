@@ -74,6 +74,10 @@ pub struct StreamState {
     /// back up to the true pre-truncation size. `None` leaves usage untouched.
     /// See `handlers::apply_input_char_scale`.
     pub(crate) truncation_scale: Option<(u64, u64)>,
+    /// Set when a chunk carries an upstream `error` (e.g. a provider outage
+    /// reported mid-stream). Once set, [`build_completion_events`] emits
+    /// `response.failed` instead of treating the turn as completed.
+    pub error: Option<chat::ChatError>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -289,6 +293,10 @@ pub fn process_chunk_value(
     // events with a proxy-side timestamp.
     if state.created == 0 {
         state.created = chunk.created;
+    }
+
+    if chunk.error.is_some() {
+        state.error = chunk.error;
     }
 
     // Capture usage whenever the provider includes it. The OpenAI reference
@@ -762,25 +770,37 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
     let output_items: Vec<OutputItem> = state.completed_items.clone();
 
     // ── Build final Response ──────────────────────────────────────────────
-    let (final_status, incomplete_details) = match state.finish_reason.as_deref() {
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(super::responses::IncompleteDetails {
-                reason: super::responses::IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("content_filter") => (
-            ResponseStatus::Incomplete,
-            Some(super::responses::IncompleteDetails {
-                reason: super::responses::IncompleteReason::ContentFilter,
-            }),
-        ),
-        _ => (ResponseStatus::Completed, None),
+    let (final_status, incomplete_details) = if state.error.is_some() {
+        (ResponseStatus::Failed, None)
+    } else {
+        match state.finish_reason.as_deref() {
+            Some("length") => (
+                ResponseStatus::Incomplete,
+                Some(super::responses::IncompleteDetails {
+                    reason: super::responses::IncompleteReason::MaxOutputTokens,
+                }),
+            ),
+            Some("content_filter") => (
+                ResponseStatus::Incomplete,
+                Some(super::responses::IncompleteDetails {
+                    reason: super::responses::IncompleteReason::ContentFilter,
+                }),
+            ),
+            _ => (ResponseStatus::Completed, None),
+        }
     };
 
     let mut response = build_partial_response(state, final_status);
     response.output = output_items;
     response.incomplete_details = incomplete_details;
+    if let Some(ref error) = state.error {
+        response.error = Some(super::responses::Error {
+            code: error.code.clone(),
+            message: error.message.clone(),
+            r#type: None,
+            param: error.param.clone(),
+        });
+    }
 
     if let Some(ref usage) = state.usage {
         let mut u = super::responses::Usage::from(usage.clone());
@@ -801,6 +821,12 @@ pub fn build_completion_events(state: &mut StreamState) -> Vec<StreamEvent> {
     match final_status {
         ResponseStatus::Incomplete => {
             events.push(StreamEvent::Incomplete(event::Incomplete {
+                response,
+                sequence_number: next_seq(state),
+            }));
+        }
+        ResponseStatus::Failed => {
+            events.push(StreamEvent::Failed(event::Failed {
                 response,
                 sequence_number: next_seq(state),
             }));
