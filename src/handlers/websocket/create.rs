@@ -22,13 +22,18 @@ fn ws_response(rid: &str, model: &str, now: i64, status: ResponseStatus) -> Resp
     }
 }
 
-/// Handle a `response.create` event: parse, forward to upstream, stream back results.
+/// Handle a `response.create` event: parse, forward to upstream, stream back
+/// results. Returns any WS messages that arrived mid-stream and were buffered
+/// instead of being discarded (see `run_stream`) — the caller must feed these
+/// back into its dispatch loop instead of reading fresh ones off the socket,
+/// so nothing sent concurrently (e.g. a sub-agent's task in multi-agent mode)
+/// is lost.
 pub(super) async fn handle(
     state: &crate::app::State,
     socket: &mut WebSocket,
     mut req: Request,
     ns: &str,
-) {
+) -> Vec<WsMsg> {
     tracing::debug!("input items {}", req.input.len());
 
     let provider = match state.config().models.get(&req.model) {
@@ -41,7 +46,7 @@ pub(super) async fn handle(
                 format!("Unknown model: {}", req.model),
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
     };
 
@@ -56,7 +61,7 @@ pub(super) async fn handle(
                     e.to_string(),
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         };
         if let Err(message) =
@@ -69,7 +74,7 @@ pub(super) async fn handle(
                 message,
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
         req = match serde_json::from_value(body) {
             Ok(req) => req,
@@ -81,7 +86,7 @@ pub(super) async fn handle(
                     e.to_string(),
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         };
     }
@@ -96,7 +101,7 @@ pub(super) async fn handle(
         .any(|i| matches!(i, crate::types::item::InputItem::CompactionTrigger(_)))
     {
         handle_compaction_trigger(state, &provider, socket, req, ns).await;
-        return;
+        return Vec::new();
     }
 
     let model = req.model.clone();
@@ -146,7 +151,7 @@ pub(super) async fn handle(
                 format!("Unsupported features: {}", unsupported.join(", ")),
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
     };
     chat_req.model = provider.model.clone();
@@ -246,7 +251,7 @@ pub(super) async fn handle(
                         message,
                     );
                     super::send(socket, &ws_err.to_json_string()).await;
-                    return;
+                    return Vec::new();
                 }
             }
         }
@@ -261,7 +266,7 @@ pub(super) async fn handle(
             )
             .await;
         state.store().put(rid, full_input_messages).await;
-        return;
+        return Vec::new();
     }
 
     // Buffered path for upstreams that can't stream structured output — the same
@@ -291,7 +296,7 @@ pub(super) async fn handle(
             truncation_scale,
         )
         .await;
-        return;
+        return Vec::new();
     }
 
     let url = format!("{}/chat/completions", provider.base_url);
@@ -318,7 +323,7 @@ pub(super) async fn handle(
                     e.to_string(),
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         };
         if let Err(message) = crate::rewrite::apply_rewrite(&mut body, &provider.rewrite.chat_out) {
@@ -329,7 +334,7 @@ pub(super) async fn handle(
                 message,
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
         tracing::debug!(
             "chat request: {}",
@@ -347,7 +352,7 @@ pub(super) async fn handle(
                 format!("Upstream error: {e}"),
             );
             super::send(socket, &ws_err.to_json_string()).await;
-            return;
+            return Vec::new();
         }
     };
 
@@ -363,7 +368,7 @@ pub(super) async fn handle(
             ),
         );
         super::send(socket, &ws_err.to_json_string()).await;
-        return;
+        return Vec::new();
     }
 
     // Send lifecycle start events (typed, with sequence_number)
@@ -397,7 +402,7 @@ pub(super) async fn handle(
                     message,
                 );
                 super::send(socket, &ws_err.to_json_string()).await;
-                return;
+                return Vec::new();
             }
         }
     }
@@ -418,7 +423,7 @@ pub(super) async fn handle(
         tool_namespaces,
         truncation_scale,
     };
-    let (response_msg, cancelled, stream_events) =
+    let (response_msg, cancelled, stream_events, pending) =
         run_stream(socket, stream_resp, stream_context, cancel_rx).await;
     let events = initial_events;
     // stream_events are already sent, just used for counting
@@ -457,10 +462,16 @@ pub(super) async fn handle(
             .await;
         state.store().put(rid, full_input_messages).await;
     }
+    pending
 }
 
 /// Relay SSE chunks from upstream to WebSocket, with cancel detection.
-/// Returns (response_message, cancelled, collected_events).
+/// Returns (response_message, cancelled, collected_events, pending). `pending`
+/// holds any WS message received mid-stream that wasn't a cancel frame — e.g.
+/// a `response.create` for another agent on this same connection (multi-agent
+/// mode multiplexes every agent over one WS). It must not be discarded: the
+/// caller hands it back to the outer dispatch loop instead of letting it
+/// vanish, and this stream keeps running to completion undisturbed.
 struct WsStreamContext<'a> {
     rid: &'a str,
     mid: &'a str,
@@ -479,7 +490,7 @@ async fn run_stream(
     stream_resp: reqwest::Response,
     context: WsStreamContext<'_>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-) -> (chat::ResponseMessage, bool, Vec<StreamEvent>) {
+) -> (chat::ResponseMessage, bool, Vec<StreamEvent>, Vec<WsMsg>) {
     let mut buf = String::new();
     let mut ss = StreamState::new(
         context.rid.to_string(),
@@ -495,6 +506,7 @@ async fn run_stream(
     let mut byte_stream = stream_resp.bytes_stream();
     let mut cancelled = false;
     let mut collected_events: Vec<StreamEvent> = Vec::new();
+    let mut pending: Vec<WsMsg> = Vec::new();
 
     loop {
         tokio::select! {
@@ -532,7 +544,7 @@ async fn run_stream(
                                             collected_events.push(prepared.event);
                                             if socket.send(WsMsg::Text(msg.into())).await.is_err() {
                                                 tracing::info!("WS send failed");
-                                                return (ss.to_response_message(), false, collected_events);
+                                                return (ss.to_response_message(), false, collected_events, pending);
                                             }
                                         }
                                     }
@@ -546,7 +558,7 @@ async fn run_stream(
                                         let msg = ws_err.to_json_string();
                                         tracing::debug!("WS send: {msg}");
                                         let _ = socket.send(WsMsg::Text(msg.into())).await;
-                                        return (ss.to_response_message(), false, collected_events);
+                                        return (ss.to_response_message(), false, collected_events, pending);
                                     }
                                 }
                             }
@@ -564,12 +576,28 @@ async fn run_stream(
                         cancelled = true;
                         break;
                     }
+                    // Any other message (e.g. a `response.create` for another
+                    // agent on this same connection) — buffer it for the outer
+                    // dispatch loop instead of discarding it and aborting this
+                    // still-in-progress stream.
+                    Some(Ok(other)) => {
+                        tracing::debug!(
+                            "WS: buffering message received mid-stream for dispatch after this response completes"
+                        );
+                        pending.push(other);
+                    }
+                    // Socket actually closed or errored — genuinely terminal.
                     _ => break,
                 }
             }
         }
     }
-    (ss.to_response_message(), cancelled, collected_events)
+    (
+        ss.to_response_message(),
+        cancelled,
+        collected_events,
+        pending,
+    )
 }
 
 /// Run the shared compaction helper and emit a four-event lifecycle on the

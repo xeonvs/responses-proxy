@@ -2,8 +2,8 @@
 //!
 //! ## Tagged unions
 //!
-//! - `InputItem` and `OutputItem` have an `Unknown(serde_json::Value)` catch-all
-//!   variant for forward compatibility.
+//! - `InputItem`, `OutputItem`, and `AgentMessageContent` have an
+//!   `Unknown(serde_json::Value)` catch-all variant for forward compatibility.
 //! - `InputContentBlock`, `OutputContentBlock`, and `OutputAnnotation` use
 //!   derive-based serde tagged on `type`.
 
@@ -615,6 +615,42 @@ pub struct ContextCompaction {
     pub encrypted_content: Option<String>,
 }
 
+/// Content block within an [`AgentMessage`] item. Has an `Unknown` catch-all
+/// (mirroring `InputItem`/`OutputItem`, see the module doc comment) so a
+/// content-block shape this proxy doesn't recognize fails just that one
+/// block instead of the whole `AgentMessage` — and therefore the whole
+/// request — being rejected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessageContent {
+    InputText {
+        text: String,
+    },
+    EncryptedContent {
+        encrypted_content: String,
+    },
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+/// Inter-agent communication item. Multi-agent mode (the `collaboration`
+/// namespace: `spawn_agent`, `send_message`, `followup_task`, ...) delivers
+/// task assignments and messages between the root agent and its sub-agents
+/// as this item type rather than a plain `message`, so it can carry routing
+/// (`author`/`recipient` agent paths). Codex replays it as history on the
+/// receiving agent's own turns — this is how a sub-agent actually learns
+/// what task it was given.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AgentMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub author: String,
+    pub recipient: String,
+    #[serde(default)]
+    pub content: Vec<AgentMessageContent>,
+}
+
 /// Computer call.  Doc §3.9.f.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -934,7 +970,7 @@ pub struct AdditionalTools {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Input item union type — elements of the `input` array in API requests.
-/// Dispatched by `type` field.  28 variants + Unknown catch-all.
+/// Dispatched by `type` field.  29 variants + Unknown catch-all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputItem {
@@ -957,6 +993,7 @@ pub enum InputItem {
     Compaction(Compaction),
     CompactionTrigger(CompactionTrigger),
     ContextCompaction(ContextCompaction),
+    AgentMessage(AgentMessage),
     LocalShellCall(LocalShellCall),
     LocalShellCallOutput(LocalShellCallOutput),
     ShellCall(ShellCall),

@@ -65,6 +65,18 @@ base_url = "http://localhost:3000/v1"
 > ```
 > With both off, Codex never advertises the `collaboration` tools and the
 > proxy's namespace handling is simply a no-op — no other behavior changes.
+>
+> **Confirmed: intermittent empty sub-agent task text is a Codex-side bug,
+> not this proxy.** Trace-log inspection of a live `multi_agent_v2` session
+> showed the root agent's own `spawn_agent`/`followup_task` tool call
+> arriving with a full, non-empty `message` field, but the very next
+> upstream request — the new sub-agent's own separate call, built entirely
+> by Codex's client-side thread manager — already carried an empty
+> `Payload` in its `NEW_TASK` envelope. That envelope format is not
+> constructed anywhere in this proxy; it is opaque text Codex hands the
+> proxy to relay as-is, so the text is lost before it ever reaches the
+> proxy over the wire. If sub-agents keep reporting an empty payload after
+> a retry, turning the flags off above is the only known workaround.
 
 Codex ≥ 0.134 no longer reads inline `[profiles.<name>]` tables — put the
 profile in its own overlay file at `~/.codex/<name>.config.toml` with top-level
