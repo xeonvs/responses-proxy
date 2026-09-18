@@ -195,9 +195,10 @@ pub struct Request {
 pub struct ChatError {
     /// Human-readable error message.
     pub message: String,
-    /// Error type, e.g. `"invalid_request_error"`.
-    #[serde(rename = "type")]
-    pub type_: String,
+    /// Error type, e.g. `"invalid_request_error"`. Some providers omit this
+    /// on mid-stream errors (e.g. a provider outage), so it isn't required.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub type_: Option<String>,
     /// Machine-readable error code.  May be `null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -258,6 +259,13 @@ fn default_completion_object() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Chunk {
+    /// Error from upstream, sent mid-stream in place of a normal delta (e.g. a
+    /// provider outage). When present, `choices` still carries a shape-valid
+    /// entry (typically empty `delta.content` and `finish_reason: "error"`),
+    /// but the choice itself carries no useful content.
+    #[serde(default)]
+    pub error: Option<ChatError>,
+
     /// A unique identifier for the chat completion. Each chunk has the same ID.
     pub id: String,
 

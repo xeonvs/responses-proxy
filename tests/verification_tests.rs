@@ -2204,3 +2204,38 @@ fn hard_budget_applies_on_top_of_age_truncation() {
         assert_eq!(j[i + 2]["tool_call_id"].as_str().unwrap(), expected_id);
     }
 }
+
+// Regression: some upstream providers report an outage mid-stream by sending
+// a chunk with a top-level `error` field instead of a normal delta, alongside
+// `finish_reason: "error"`. The old code had no `error` field on `Chunk` at
+// all, so this was silently dropped, `finish_reason` fell through to the
+// default match arm, and the turn was reported as `response.completed` with
+// empty output — Codex had no way to tell the turn had actually failed.
+#[tokio::test]
+async fn streaming_upstream_error_chunk_reported_as_failed() {
+    let mut state = StreamState::new("resp_test".into(), "msg_test".into(), "gpt-5.6-sol".into());
+
+    process_chunk_value(
+        &mut state,
+        serde_json::from_str(r#"{"id":"cmpl-1","object":"chat.completion.chunk","created":1,"model":"gpt-5.6-sol","provider":"openai","error":{"code":"provider_model_down","message":"Provider model is down"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#).unwrap(),
+    );
+
+    let events = build_completion_events(&mut state);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Completed(_))),
+        "an upstream error must not be reported as a normal completion"
+    );
+    let failed = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Failed(v) => Some(v),
+            _ => None,
+        })
+        .expect("expected a response.failed event");
+    let j = serde_json::to_value(failed).unwrap();
+    assert_eq!(j["response"]["status"], "failed");
+    assert_eq!(j["response"]["error"]["code"], "provider_model_down");
+    assert_eq!(j["response"]["error"]["message"], "Provider model is down");
+}
