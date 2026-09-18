@@ -231,6 +231,20 @@ pub async fn responses_to_chat(
                         }));
                     }
                 }
+                InputItem::AgentMessage(am) => {
+                    flush_tools(
+                        &mut messages,
+                        &mut pending_tool_calls,
+                        &mut pending_reasoning,
+                    );
+                    messages.append(&mut deferred);
+                    if let Some(text) = agent_message_text(&am, state.compact_key()) {
+                        messages.push(chat::MessageRequest::User(chat::UserMessage {
+                            content: chat::UserContent::Text(text),
+                            name: None,
+                        }));
+                    }
+                }
                 InputItem::FunctionCall(fc) => {
                     pending_tool_calls.push(chat::ToolCallRequest::Function {
                         id: fc.call_id.clone(),
@@ -758,9 +772,12 @@ fn tool_request_type_label(t: &crate::types::tool::ToolRequest) -> &'static str 
 fn function_tool(
     name: String,
     description: Option<String>,
-    parameters: Option<serde_json::Value>,
+    mut parameters: Option<serde_json::Value>,
     strict: Option<bool>,
 ) -> chat::ToolRequest {
+    if let Some(ref mut params) = parameters {
+        strip_codex_schema_extensions(params);
+    }
     chat::ToolRequest::Function {
         function: chat::FunctionTool {
             name,
@@ -768,6 +785,30 @@ fn function_tool(
             parameters,
             strict,
         },
+    }
+}
+
+/// Codex tags some `collaboration`-namespace parameters (e.g. `spawn_agent`'s
+/// `message`) with a non-standard `encrypted` JSON Schema keyword, presumably
+/// for its own client-side handling. The upstream backend's schema validator
+/// rejects it outright — not with a clean 400, but by failing the whole
+/// generation and reporting a misleading `provider_model_down` error. Strip it
+/// (and any future Codex-only annotation added the same way) before the
+/// schema reaches Chat Completions.
+fn strip_codex_schema_extensions(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("encrypted");
+            for v in map.values_mut() {
+                strip_codex_schema_extensions(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                strip_codex_schema_extensions(v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1070,6 +1111,41 @@ pub fn enforce_tool_budget(
     dropped
 }
 
+/// Joins an [`AgentMessage`]'s content blocks into plain text. Encrypted
+/// blocks are decrypted with the compaction key (same mechanism as
+/// `Compaction`/`ContextCompaction`) when available; a block that can't be
+/// decrypted is dropped rather than failing the whole message. Returns `None`
+/// if nothing readable survives, so the caller can skip pushing an empty
+/// message.
+fn agent_message_text(am: &AgentMessage, key: Option<&[u8; 32]>) -> Option<String> {
+    let mut parts = Vec::with_capacity(am.content.len());
+    for block in &am.content {
+        match block {
+            AgentMessageContent::InputText { text } => parts.push(text.clone()),
+            AgentMessageContent::EncryptedContent { encrypted_content } => {
+                if let Some(key) = key
+                    && let Some(decrypted) = crate::crypto::decrypt(key, encrypted_content)
+                    && !decrypted.is_empty()
+                {
+                    parts.push(decrypted);
+                }
+            }
+            AgentMessageContent::Unknown(_) => {}
+        }
+    }
+    if parts.is_empty() {
+        tracing::warn!(
+            author = %am.author,
+            recipient = %am.recipient,
+            blocks = am.content.len(),
+            "agent_message produced no readable text — dropping (empty, undecryptable, or unrecognized content)"
+        );
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 /// A short, log-safe label for an input item that the converter does not map to
 /// a Chat message. Codex replays large items (image base64, encrypted
 /// summaries) that must never be logged verbatim — only the discriminant `type`
@@ -1177,6 +1253,20 @@ pub fn items_to_chat_messages(
                 {
                     messages.push(chat::MessageRequest::System(chat::SystemMessage {
                         content: chat::MessageContent::Text(text),
+                        name: None,
+                    }));
+                }
+            }
+            InputItem::AgentMessage(am) => {
+                flush(
+                    &mut messages,
+                    &mut pending_tool_calls,
+                    &mut pending_reasoning,
+                );
+                messages.append(&mut deferred);
+                if let Some(text) = agent_message_text(am, state.compact_key()) {
+                    messages.push(chat::MessageRequest::User(chat::UserMessage {
+                        content: chat::UserContent::Text(text),
                         name: None,
                     }));
                 }

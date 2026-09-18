@@ -424,6 +424,163 @@ async fn multi_agent_collaboration_tools_pass_through() {
     );
 }
 
+// Regression: `spawn_agent`/`send_message`/`followup_task` tag their `message`
+// parameter with a non-standard `encrypted` JSON Schema keyword. The upstream
+// backend's schema validator doesn't tolerate unknown keywords there — it
+// doesn't return a clean 400, it fails the whole generation and reports a
+// misleading `provider_model_down` error (confirmed live: stripping this key
+// from the request is the only change needed to make the exact same request
+// succeed). It must be dropped before the schema reaches Chat Completions.
+#[tokio::test]
+async fn multi_agent_encrypted_schema_keyword_stripped() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {"type": "namespace", "name": "collaboration",
+                     "description": "Tools for spawning and managing sub-agents.",
+                     "tools": [
+                        {"type": "function", "name": "spawn_agent",
+                         "parameters": {"type": "object", "properties": {
+                            "message": {"type": "string", "encrypted": true},
+                            "task_name": {"type": "string"}
+                         }, "required": ["task_name", "message"]}}
+                    ]}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let tools = j["tools"].as_array().expect("tools present");
+    let spawn_agent = tools
+        .iter()
+        .find(|t| t["function"]["name"] == "spawn_agent")
+        .expect("spawn_agent present");
+    let message_schema = &spawn_agent["function"]["parameters"]["properties"]["message"];
+    assert!(
+        message_schema.get("encrypted").is_none(),
+        "the non-standard `encrypted` keyword must be stripped: {message_schema:?}"
+    );
+    assert_eq!(
+        message_schema["type"], "string",
+        "the rest of the schema must survive untouched"
+    );
+}
+
+// Regression: multi-agent mode delivers a sub-agent's task assignment (and
+// inter-agent messages generally) as an `agent_message` input item — not a
+// plain `message` — so it can carry `author`/`recipient` agent-path routing.
+// The converter had no arm for this type, so it fell into the generic
+// unconvertible-item warn-and-skip path: the sub-agent's Chat Completions
+// request ended up with no task content at all, and the model had nothing to
+// do (observed live: the sub-agent immediately reported "done" without acting
+// on the task). It must convert to a real chat message instead of vanishing.
+#[tokio::test]
+async fn multi_agent_agent_message_item_converts_to_user_message() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "root",
+                "recipient": "m2c_reddy_surface",
+                "content": [
+                    {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\nImplement the reddy surface renderer."}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let messages = j["messages"].as_array().expect("messages present");
+    let delivered = messages
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("Implement the reddy surface renderer."))
+        })
+        .expect("the agent_message task text must reach the model, not be dropped");
+    assert_eq!(delivered["role"], "user");
+}
+
+// An agent_message content block Codex sends in a shape this proxy doesn't
+// (yet) recognize must not blow up the whole request — it should fall into
+// AgentMessageContent::Unknown and be skipped, while the rest of the message
+// still gets through, and the WS ClientEvent envelope still deserializes.
+#[tokio::test]
+async fn multi_agent_agent_message_unknown_content_block_does_not_reject_request() {
+    let event: responses_proxy::types::websocket::ClientEvent = serde_json::from_value(json!({
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "root",
+                "recipient": "m2c_reddy_surface",
+                "content": [
+                    {"type": "some_future_block", "foo": "bar"},
+                    {"type": "input_text", "text": "Implement the reddy surface renderer."}
+                ]
+            }
+        ]
+    }))
+    .expect("an unrecognized content-block shape must not reject the whole ClientEvent");
+
+    let req = match event {
+        responses_proxy::types::websocket::ClientEvent::ResponseCreate(req) => req,
+        _ => panic!("expected response.create"),
+    };
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let messages = j["messages"].as_array().expect("messages present");
+    assert!(
+        messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("Implement the reddy surface renderer."))),
+        "the readable block must still reach the model despite the unrecognized sibling block"
+    );
+}
+
+// When every content block is empty, unrecognized, or fails to decrypt, no
+// message should be pushed at all (silent drop is intentional — the model
+// gets nothing to act on either way — but it must not panic or inject a
+// stray empty message).
+#[tokio::test]
+async fn multi_agent_agent_message_all_unreadable_produces_no_message() {
+    let req: responses::Request = serde_json::from_value(json!({
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "agent_message",
+                "author": "root",
+                "recipient": "m2c_reddy_surface",
+                "content": [
+                    {"type": "some_future_block", "foo": "bar"},
+                    {"type": "encrypted_content", "encrypted_content": "not-valid-ciphertext"}
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let chat = responses_to_chat(req, &test_state()).await.unwrap();
+    let j = serde_json::to_value(&chat).unwrap();
+    let messages = j["messages"].as_array().expect("messages present");
+    assert!(
+        messages.is_empty(),
+        "no readable content should push a message: {messages:?}"
+    );
+}
+
 #[tokio::test]
 async fn multi_agent_hosted_action_passes_through_as_plain_function() {
     // A multi-agent action arriving as a bare top-level tool, or inside a
