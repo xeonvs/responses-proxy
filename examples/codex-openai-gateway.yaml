@@ -75,6 +75,22 @@ models:
       base-url: $GATEWAY_BASE_URL
       timeout: 300
 
+  gpt-6-sol:
+    model: openai/gpt-6-sol
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
+  gpt-6-luna:
+    model: openai/gpt-6-luna
+    rewrite: openai-gateway-5.6
+    provider:
+      api-key: $GATEWAY_API_KEY
+      base-url: $GATEWAY_BASE_URL
+      timeout: 300
+
   # Some apps request "gpt-reserve" as an application-level fallback alias
   # when their configured model is unavailable ("Unknown model: gpt-reserve").
   # This is not a real upstream model — point it at whichever configured
